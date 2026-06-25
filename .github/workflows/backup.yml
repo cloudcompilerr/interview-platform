@@ -1,0 +1,39 @@
+name: Daily Backup
+
+# Interview data itself lives only in each user's browser localStorage — this
+# workflow cannot reach into someone's browser. What it does is make sure the
+# repository (question banks, exported backup files placed under backups/,
+# docs, etc.) is never left with uncommitted drift, and gives you a daily
+# commit checkpoint / version history to roll back to if something goes wrong.
+
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Commit any pending changes
+        run: |
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to back up today."
+          else
+            git commit -m "chore: automated daily backup $(date -u +'%Y-%m-%d')"
+            git push origin HEAD:main
+          fi
