@@ -20,8 +20,9 @@ Type any username and any password, then click **Sign In**. This is a demo gate 
 1. Click **New Interview** in the sidebar.
 2. Enter a candidate name, e.g. `Alex Rivera`.
 3. Pick a domain — try **Generative AI**.
-4. Set the interviewer name and date (defaults are fine).
-5. Click **Start Interview**.
+4. Pick a candidate level — try **Entry-Level**. The question count updates to show how many questions (domain + Behavioral & SDLC, both at this level) will be used.
+5. Set the interviewer name and date (defaults are fine).
+6. Click **Start Interview**.
 
 ## 4. Record responses (5 minutes)
 
@@ -29,13 +30,14 @@ For each question shown:
 
 1. Type a short summary of how the candidate answered in the **Candidate Response** box.
 2. Pick a **Rating** from 1–10.
+3. If a question has one, click **Show Reference Answer** to reveal what a strong answer covers — handy if the question is outside your own expertise.
 
 When you're done with all questions, click **Continue to Assessment**.
 
 ## 5. Finish the assessment (2 minutes)
 
 1. Set **Technical**, **Behavioral**, and **SDLC** scores.
-2. Write a short **Overall Assessment**.
+2. Jot quick **Feedback Notes** as bullet points, one per line, then click **Generate Assessment from Notes** to turn them into a paragraph (uses Claude if you've added an API key in Settings and you're online; otherwise falls back to plain formatting automatically) — or just type the **Overall Assessment** directly.
 3. Pick a **Recommendation** — Recommend, Consider, or Reject.
 4. Click **Complete Interview**.
 

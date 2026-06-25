@@ -6,8 +6,9 @@ import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 
 const STORAGE_KEYS = {
   session: 'ip_session_v1',
-  domains: 'ip_domains_v1',
-  interviews: 'ip_interviews_v1',
+  domains: 'ip_domains_v2',
+  interviews: 'ip_interviews_v2',
+  settings: 'ip_settings_v1',
 };
 
 const RATING_VALUES = Array.from({ length: 10 }, (_, i) => i + 1);
@@ -27,42 +28,370 @@ const RECOMMENDATION_TONES = {
 const STATUS_LABELS = { in_progress: 'In Progress', completed: 'Completed' };
 const STATUS_TONES = { in_progress: 'info', completed: 'success' };
 
+// Candidate seniority levels. Each question in the bank is tagged with one of
+// these, and a New Interview pulls only the questions matching the selected
+// level (plus the level-matched Behavioral & SDLC set — see BEHAVIORAL_DOMAIN_ID).
+const LEVELS = [
+  { id: 'fresher', label: 'Fresher (Final-Year Student)' },
+  { id: 'entry', label: 'Entry-Level' },
+  { id: 'intermediate', label: 'Intermediate' },
+  { id: 'advanced', label: 'Advanced' },
+  { id: 'expert', label: 'Expert' },
+];
+const LEVEL_LABELS = Object.fromEntries(LEVELS.map((l) => [l.id, l.label]));
+
+// This domain's questions aren't a standalone interview choice — they're
+// spliced into every interview alongside whichever technical domain is picked.
+const BEHAVIORAL_DOMAIN_ID = 'behavioral-sdlc';
+
+// Model used for "Collate with AI" — see collateFeedbackWithAI(). Swap this to
+// 'claude-haiku-4-5' for a much cheaper/faster result on this lightweight
+// formatting task; defaults to Opus for best quality.
+const CLAUDE_MODEL_ID = 'claude-opus-4-8';
+
 const NAV_ITEMS = [
   { id: 'dashboard', label: 'Dashboard' },
   { id: 'new', label: 'New Interview' },
   { id: 'questions', label: 'Question Bank' },
   { id: 'data', label: 'Data & Reports' },
+  { id: 'settings', label: 'Settings' },
 ];
 
+// Each question carries a `level` (see LEVELS) and a `referenceAnswer` — a
+// short model answer so an interviewer can judge a response even outside
+// their own domain expertise.
 const DEFAULT_DOMAINS = [
   {
     id: 'computer-vision',
     name: 'Computer Vision',
     questions: [
-      { id: 'cv-q1', text: 'Explain the difference between object detection and image segmentation. When would you use each?' },
-      { id: 'cv-q2', text: 'Walk through how a Convolutional Neural Network processes an image, layer by layer.' },
-      { id: 'cv-q3', text: 'How would you handle a dataset with severe class imbalance in an image classification task?' },
-      { id: 'cv-q4', text: 'Describe a time you had to optimize a computer vision model for inference speed on edge devices.' },
+      {
+        id: 'cv-fresher-1',
+        level: 'fresher',
+        text: 'What is the difference between a grayscale image and an RGB image, in terms of how they are stored as arrays?',
+        referenceAnswer:
+          'Grayscale is a single 2D matrix — one intensity value per pixel (0-255 for 8-bit). RGB is a 3D array (height x width x 3 channels) holding Red, Green, and Blue intensity separately; combining the channels produces the perceived color. A grayscale image needs roughly a third of the storage of an uncompressed RGB image.',
+      },
+      {
+        id: 'cv-fresher-2',
+        level: 'fresher',
+        text: 'What does a convolution operation do in a CNN, intuitively?',
+        referenceAnswer:
+          'A small filter (kernel) slides over the image computing a weighted sum of the pixels it overlaps, producing one output value per position. This detects local patterns like edges or textures regardless of where they appear in the image, because the same weights are reused everywhere (translation invariance).',
+      },
+      {
+        id: 'cv-fresher-3',
+        level: 'fresher',
+        text: 'Why do we normalize pixel values before feeding images into a neural network?',
+        referenceAnswer:
+          'Raw pixel values (0-255) are on a much larger, less consistent scale than typical weight initializations expect. Normalizing (e.g. to [0,1] or using mean/std normalization) speeds up convergence, helps prevent exploding or vanishing gradients, and makes learning-rate tuning more predictable.',
+      },
+      {
+        id: 'cv-entry-1',
+        level: 'entry',
+        text: 'Explain the difference between object detection and image segmentation. When would you use each?',
+        referenceAnswer:
+          'Object detection draws bounding boxes with a class label per object instance — good when you need "what and roughly where". Segmentation (semantic or instance) labels every pixel — needed when precise boundaries matter, e.g. medical imaging or lane detection.',
+      },
+      {
+        id: 'cv-entry-2',
+        level: 'entry',
+        text: 'What is data augmentation, and name three techniques you would use for an image classification task?',
+        referenceAnswer:
+          'Synthetic variation of training data to improve generalization without collecting more data. Techniques: random crop/flip, rotation, color jitter/brightness changes, cutout/mixup, and adding noise.',
+      },
+      {
+        id: 'cv-entry-3',
+        level: 'entry',
+        text: 'Walk through a typical CNN architecture for image classification, from input to output.',
+        referenceAnswer:
+          'Input image, then stacked Conv + ReLU + Pool blocks that extract increasingly abstract features, then a flatten or global-average-pool step, then one or more fully connected layers, then a softmax over class scores. Modern nets add batch norm and skip connections for stability and depth.',
+      },
+      {
+        id: 'cv-intermediate-1',
+        level: 'intermediate',
+        text: 'How would you handle a dataset with severe class imbalance in an image classification task?',
+        referenceAnswer:
+          'Class-weighted loss, oversampling the minority class or undersampling the majority, focal loss, targeted augmentation on minority classes, stratified sampling, and evaluating with F1/PR-AUC instead of raw accuracy.',
+      },
+      {
+        id: 'cv-intermediate-2',
+        level: 'intermediate',
+        text: 'Explain transfer learning and when you would fine-tune all layers versus freeze the backbone.',
+        referenceAnswer:
+          'Reuse a model pretrained on a large dataset (e.g. ImageNet) as a feature extractor. Freeze the backbone and train only the head when the target dataset is small or similar in domain; fine-tune more or all layers when there is more data or the domain differs significantly, so low-level features adapt too.',
+      },
+      {
+        id: 'cv-intermediate-3',
+        level: 'intermediate',
+        text: 'What is the difference between anchor-based and anchor-free object detectors?',
+        referenceAnswer:
+          'Anchor-based detectors (e.g. Faster R-CNN, YOLOv3) predefine boxes of various scales/ratios at each location and regress offsets — mature and accurate but more hyperparameters. Anchor-free detectors (e.g. CenterNet, FCOS) predict object centers or keypoints directly — simpler and often faster, with fewer hyperparameters to tune.',
+      },
+      {
+        id: 'cv-advanced-1',
+        level: 'advanced',
+        text: 'Describe a time you had to optimize a computer vision model for inference speed on edge devices.',
+        referenceAnswer:
+          'Look for: model compression (quantization, pruning), an efficient architecture (MobileNet/EfficientNet-lite), knowledge distillation, operator fusion, a fast runtime (TensorRT, ONNX Runtime, TFLite), profiling to find the actual bottleneck rather than guessing, and a measured before/after latency or FPS number.',
+      },
+      {
+        id: 'cv-advanced-2',
+        level: 'advanced',
+        text: 'How would you debug a model that performs well on validation but poorly in production?',
+        referenceAnswer:
+          'Look for train/serve skew (different preprocessing), distribution shift (different camera, lighting, or demographics in production vs. the validation set), label leakage in validation, data drift over time, and a plan to add production monitoring or shadow evaluation.',
+      },
+      {
+        id: 'cv-advanced-3',
+        level: 'advanced',
+        text: 'Explain how Non-Maximum Suppression (NMS) works, and a limitation of it.',
+        referenceAnswer:
+          'NMS keeps the highest-confidence box in a cluster of overlapping boxes (IoU above a threshold) and suppresses the rest. Limitation: it can suppress genuinely separate, overlapping objects in crowded scenes; alternatives include Soft-NMS or detectors like DETR that need no NMS at all.',
+      },
+      {
+        id: 'cv-expert-1',
+        level: 'expert',
+        text: 'How would you design a CV system that needs to keep improving post-deployment without full retraining cycles?',
+        referenceAnswer:
+          'Look for: active learning / human-in-the-loop labeling for hard examples, a continual fine-tuning pipeline, drift monitoring, canary or shadow deployments, a feedback loop from production errors back into the training set, and versioned datasets/models.',
+      },
+      {
+        id: 'cv-expert-2',
+        level: 'expert',
+        text: 'Discuss the trade-offs between two-stage and single-stage detectors at scale, and how you would choose for a high-throughput production system.',
+        referenceAnswer:
+          'Two-stage (Faster R-CNN family): higher accuracy, especially on small or dense objects, but slower. Single-stage (YOLO/SSD family): faster, simpler pipeline, better for real-time, historically weaker on small objects though modern variants close the gap. The choice depends on the latency budget, object density, and whether accuracy or throughput dominates the SLA.',
+      },
+      {
+        id: 'cv-expert-3',
+        level: 'expert',
+        text: 'How would you approach a vision foundation model strategy for a company with many downstream CV tasks (detection, segmentation, classification)?',
+        referenceAnswer:
+          'Look for: a shared self-supervised pretrained backbone (e.g. DINO, CLIP, SAM-style) with lightweight task-specific heads, reasoning about the compute/cost trade-off of fine-tuning per task vs. one shared backbone, a data flywheel strategy, and awareness of licensing/cost trade-offs of foundation models vs. training in-house.',
+      },
     ],
   },
   {
     id: 'generative-ai',
     name: 'Generative AI',
     questions: [
-      { id: 'genai-q1', text: 'Explain how transformer attention mechanisms work and why they replaced RNNs for most NLP tasks.' },
-      { id: 'genai-q2', text: 'What is the difference between fine-tuning, RAG, and prompt engineering? When would you choose each?' },
-      { id: 'genai-q3', text: 'How would you mitigate hallucinations in a production LLM application?' },
-      { id: 'genai-q4', text: 'Describe how you would evaluate the quality of a generative AI system before shipping it.' },
+      {
+        id: 'genai-fresher-1',
+        level: 'fresher',
+        text: 'In simple terms, what is a Large Language Model (LLM), and how is it different from a traditional rule-based chatbot?',
+        referenceAnswer:
+          'An LLM is a neural network trained on huge amounts of text to predict the next token, learning patterns and knowledge statistically rather than from hand-written rules. This lets it generalize to inputs it has never seen, unlike a rule-based system limited to its programmed patterns.',
+      },
+      {
+        id: 'genai-fresher-2',
+        level: 'fresher',
+        text: 'What is a "prompt", and why does the wording of a prompt affect the output?',
+        referenceAnswer:
+          'A prompt is the input text given to the model. Because the model predicts continuations based on patterns learned during training, small wording changes shift the probability distribution over likely completions — clearer instructions, examples, or context steer it toward the desired output.',
+      },
+      {
+        id: 'genai-fresher-3',
+        level: 'fresher',
+        text: 'What does "hallucination" mean in the context of generative AI?',
+        referenceAnswer:
+          'When a model generates plausible-sounding but factually incorrect or fabricated information, stated confidently. It happens because the model optimizes for fluent, likely-sounding text, not verified truth.',
+      },
+      {
+        id: 'genai-entry-1',
+        level: 'entry',
+        text: 'Explain how transformer attention mechanisms work, at a high level.',
+        referenceAnswer:
+          'Self-attention lets each token look at every other token in the sequence and compute a weighted relevance score (via query/key/value vectors), letting the model capture long-range dependencies without the sequential bottleneck of RNNs.',
+      },
+      {
+        id: 'genai-entry-2',
+        level: 'entry',
+        text: 'What is the difference between fine-tuning and prompt engineering?',
+        referenceAnswer:
+          "Prompt engineering changes only the input/instructions to steer a frozen model's behavior — fast, cheap, no training needed. Fine-tuning updates the model's weights on task-specific data — a more durable behavior change, but it needs data, compute, and careful evaluation to avoid regressions.",
+      },
+      {
+        id: 'genai-entry-3',
+        level: 'entry',
+        text: "What's the role of temperature and top-p in text generation?",
+        referenceAnswer:
+          'Both control randomness when sampling the next token. Temperature scales the probability distribution (lower is more deterministic/focused, higher is more random/creative). Top-p (nucleus sampling) restricts sampling to the smallest set of tokens whose cumulative probability exceeds p, trimming the unlikely long tail.',
+      },
+      {
+        id: 'genai-intermediate-1',
+        level: 'intermediate',
+        text: 'What is the difference between fine-tuning, RAG, and prompt engineering? When would you choose each?',
+        referenceAnswer:
+          'Prompt engineering for quick behavior changes with no new data; RAG (Retrieval-Augmented Generation) when the model needs up-to-date or proprietary knowledge without retraining — retrieve relevant documents and inject them into the prompt; fine-tuning when consistent style, format, or behavior needs to be baked into the model and there is enough quality training data.',
+      },
+      {
+        id: 'genai-intermediate-2',
+        level: 'intermediate',
+        text: 'How would you mitigate hallucinations in a production LLM application?',
+        referenceAnswer:
+          'Ground responses with retrieval (RAG) and citations, constrain the output format, use lower temperature for factual tasks, add a verification or grounding pass that checks claims against sources, and design the UX to make uncertainty visible to users.',
+      },
+      {
+        id: 'genai-intermediate-3',
+        level: 'intermediate',
+        text: 'What is the difference between encoder-only, decoder-only, and encoder-decoder transformer architectures? Give an example use case for each.',
+        referenceAnswer:
+          'Encoder-only (e.g. BERT) suits understanding tasks like classification or embeddings. Decoder-only (e.g. the GPT family) suits open-ended generation. Encoder-decoder (e.g. T5, the original Transformer) suits sequence-to-sequence tasks like translation or summarization where input and output are distinct sequences.',
+      },
+      {
+        id: 'genai-advanced-1',
+        level: 'advanced',
+        text: 'Describe how you would evaluate the quality of a generative AI system before shipping it.',
+        referenceAnswer:
+          'A combination of automatic metrics (task-specific: BLEU/ROUGE for summarization, exact-match for QA, or an LLM-as-judge rubric), human evaluation on a representative sample, red-teaming for safety/hallucination/bias, and post-launch guardrail metrics like latency, cost per request, and refusal rate.',
+      },
+      {
+        id: 'genai-advanced-2',
+        level: 'advanced',
+        text: 'How would you design a RAG pipeline to keep answers grounded and reduce hallucination at scale?',
+        referenceAnswer:
+          'Look for: a deliberate chunking strategy, embedding model choice, hybrid search (vector + keyword), re-ranking retrieved chunks, citing sources in the response, a fallback for low-confidence retrieval ("I don\'t know" rather than guessing), and periodic re-indexing as the knowledge base changes.',
+      },
+      {
+        id: 'genai-advanced-3',
+        level: 'advanced',
+        text: 'What are the trade-offs of a smaller fine-tuned model versus a large general-purpose model with good prompting, for a specific production task?',
+        referenceAnswer:
+          'A smaller fine-tuned model gives lower latency/cost at scale and more consistency on the narrow task, but needs labeled data and retraining as requirements evolve. A large general model with prompting is faster to iterate and needs no training infrastructure, but costs more per call and is less predictable on edge cases unless heavily prompt-engineered.',
+      },
+      {
+        id: 'genai-expert-1',
+        level: 'expert',
+        text: 'How would you architect an LLM-based system that needs to operate reliably under rate limits, partial outages, or model deprecations from the provider?',
+        referenceAnswer:
+          'Look for: a provider/model abstraction layer with a fallback chain, request queuing with backoff and jitter, caching of repeated queries, graceful degradation to simpler logic when the model is unavailable, and monitoring for silent quality regressions after a provider-side model update.',
+      },
+      {
+        id: 'genai-expert-2',
+        level: 'expert',
+        text: 'Discuss the trade-offs between a multi-agent system and a single well-prompted model for a complex task.',
+        referenceAnswer:
+          'A multi-agent system can decompose complex tasks, specialize prompts/tools per sub-task, and parallelize work — at the cost of orchestration complexity, higher latency/cost from multiple calls, and harder debugging of emergent failures. A single model is simpler and cheaper but may struggle with tasks needing very different "modes" of reasoning or tool use in sequence.',
+      },
+      {
+        id: 'genai-expert-3',
+        level: 'expert',
+        text: 'How would you think about cost, latency, and quality trade-offs when choosing between a frontier model and a smaller, cheaper model for different parts of a product?',
+        referenceAnswer:
+          'Look for: a routing strategy where a cheap model handles easy/high-volume requests and a frontier model handles complex/high-stakes ones, caching and batching to cut cost, measuring the quality delta with real user feedback rather than assumption, and being explicit about which SLA — latency budget, cost ceiling, accuracy bar — is driving the choice for each surface.',
+      },
     ],
   },
   {
-    id: 'behavioral-sdlc',
+    id: BEHAVIORAL_DOMAIN_ID,
     name: 'Behavioral & SDLC',
     questions: [
-      { id: 'beh-q1', text: "Tell me about a time you disagreed with a teammate's technical decision. How did you handle it?" },
-      { id: 'beh-q2', text: "Walk me through your team's code review and deployment process at your last role." },
-      { id: 'beh-q3', text: 'Describe a production incident you were involved in. What was the root cause and what did you change afterward?' },
-      { id: 'beh-q4', text: 'How do you prioritize tasks when given conflicting deadlines from different stakeholders?' },
+      {
+        id: 'beh-fresher-1',
+        level: 'fresher',
+        text: 'Tell me about a project — academic, personal, or an internship — you are proud of. What was your specific contribution?',
+        referenceAnswer:
+          "Look for clear ownership of a specific piece (not just \"we built X\"), a real technical or design decision they made themselves, and genuine understanding of why it worked.",
+      },
+      {
+        id: 'beh-fresher-2',
+        level: 'fresher',
+        text: 'Have you used version control such as Git before? Walk me through how you would commit and share a change with a team.',
+        referenceAnswer:
+          'Look for basic familiarity: clone or branch, commit with a message, push, open a pull request. Bonus for understanding why small, frequent commits and descriptive messages matter for collaboration.',
+      },
+      {
+        id: 'beh-fresher-3',
+        level: 'fresher',
+        text: 'Describe a time you got stuck on a bug or problem. What did you do?',
+        referenceAnswer:
+          'Look for a real debugging process — isolating the issue, reading error messages or logs, searching documentation, asking for help appropriately — rather than giving up or guessing randomly, and what they learned from it.',
+      },
+      {
+        id: 'beh-entry-1',
+        level: 'entry',
+        text: "Walk me through your team's code review process at your last role or internship.",
+        referenceAnswer:
+          'Look for understanding of why review matters (catching bugs, knowledge sharing, consistency) and a concrete habit, like keeping PRs small or responding to feedback without taking it personally.',
+      },
+      {
+        id: 'beh-entry-2',
+        level: 'entry',
+        text: "Tell me about a time you disagreed with a teammate's technical decision. How did you handle it?",
+        referenceAnswer:
+          'Look for respectful disagreement, bringing data or reasoning rather than just opinion, willingness to be wrong, and a real resolution — escalation, compromise, or being convinced.',
+      },
+      {
+        id: 'beh-entry-3',
+        level: 'entry',
+        text: 'How do you prioritize your tasks when you have more to do than time allows?',
+        referenceAnswer:
+          'Look for a real method — impact vs. effort, deadlines, asking the manager or PM when unsure — rather than "I just do everything", and self-awareness about the trade-offs made.',
+      },
+      {
+        id: 'beh-intermediate-1',
+        level: 'intermediate',
+        text: 'Describe a production incident you were involved in. What was the root cause, and what did you change afterward?',
+        referenceAnswer:
+          'Look for ownership (not just blaming others), a clear root cause rather than just the symptom, and a concrete follow-up action — a post-mortem, added monitoring, an added test, or a process change — not just "we fixed it and moved on".',
+      },
+      {
+        id: 'beh-intermediate-2',
+        level: 'intermediate',
+        text: 'How do you approach writing tests for a feature you are building? What does your testing pyramid look like?',
+        referenceAnswer:
+          "Look for a sensible mix — more unit tests, fewer integration, fewest end-to-end — reasoning about what's worth testing (business logic, edge cases) vs. not (trivial getters), and awareness of the maintenance cost of tests.",
+      },
+      {
+        id: 'beh-intermediate-3',
+        level: 'intermediate',
+        text: 'Tell me about a time you had to push back on a deadline or scope. How did that conversation go?',
+        referenceAnswer:
+          'Look for clear communication of trade-offs backed by data (not just "it\'s hard"), proposing alternatives like reduced scope or phased delivery, and a professional, collaborative tone rather than simply refusing.',
+      },
+      {
+        id: 'beh-advanced-1',
+        level: 'advanced',
+        text: 'Describe how you have mentored a junior engineer or onboarded a new team member. What worked, and what did not?',
+        referenceAnswer:
+          "Look for concrete actions — pairing, structured onboarding docs, regular check-ins — self-reflection on what didn't work and how they adjusted, and genuine investment in the other person's growth rather than just task delegation.",
+      },
+      {
+        id: 'beh-advanced-2',
+        level: 'advanced',
+        text: 'Tell me about a time you had to make an architectural decision with incomplete information. How did you decide, and would you decide differently now?',
+        referenceAnswer:
+          'Look for a real decision-making framework — weighing reversibility, cost of being wrong, time pressure — intellectual honesty about the outcome, and learning that was actually applied to later decisions.',
+      },
+      {
+        id: 'beh-advanced-3',
+        level: 'advanced',
+        text: 'How do you balance technical debt against feature delivery pressure on your team?',
+        referenceAnswer:
+          'Look for a pragmatic approach — not "always pay it down" or "always ship features" — with examples of negotiating time for debt paydown, tying debt to concrete risk or cost, and communicating the trade-off to non-technical stakeholders.',
+      },
+      {
+        id: 'beh-expert-1',
+        level: 'expert',
+        text: 'Describe a time you had to drive a cross-team technical decision where stakeholders disagreed. How did you reach alignment?',
+        referenceAnswer:
+          'Look for stakeholder management skill, framing the decision around shared goals and data rather than authority, and a real outcome — including how they handled people who remained unconvinced.',
+      },
+      {
+        id: 'beh-expert-2',
+        level: 'expert',
+        text: 'How do you think about building a culture of engineering quality — testing, code review, incident response — across a growing organization?',
+        referenceAnswer:
+          'Look for systems thinking beyond their own team — examples of process or tooling they introduced organization-wide, how they got buy-in, and how they measured whether it actually improved outcomes, not just "we added a policy".',
+      },
+      {
+        id: 'beh-expert-3',
+        level: 'expert',
+        text: 'Tell me about the hardest engineering trade-off you have had to defend to leadership. What was at stake, and how did you make your case?',
+        referenceAnswer:
+          'Look for the ability to translate technical risk into business terms, genuinely high stakes rather than a trivial example, and composure and clarity under pushback from non-technical leadership.',
+      },
     ],
   },
 ];
@@ -200,31 +529,109 @@ function csvEscape(value) {
   return str;
 }
 
-function buildInterview({ candidateName, interviewer, date, notes, domain }) {
+function buildInterview({ candidateName, interviewer, date, notes, domain, level, behavioralDomain }) {
+  const technicalQuestions = domain.questions.filter((q) => q.level === level);
+  const behavioralQuestions = (behavioralDomain?.questions || []).filter((q) => q.level === level);
+  const responses = [...technicalQuestions, ...behavioralQuestions].map((q) => ({
+    questionId: q.id,
+    questionText: q.text,
+    referenceAnswer: q.referenceAnswer || '',
+    response: '',
+    rating: null,
+  }));
+
   return {
     id: generateId(),
     candidateName,
     domainId: domain.id,
     domainName: domain.name,
+    level,
+    levelLabel: LEVEL_LABELS[level] || level,
     interviewer: interviewer || 'Unspecified',
     date,
     notes: notes || '',
     status: 'in_progress',
-    responses: domain.questions.map((q) => ({
-      questionId: q.id,
-      questionText: q.text,
-      response: '',
-      rating: null,
-    })),
+    responses,
     technicalScore: null,
     behavioralScore: null,
     sdlcScore: null,
     overallAssessment: '',
+    feedbackBullets: '',
     recommendation: null,
     createdAt: nowIso(),
     updatedAt: nowIso(),
     completedAt: null,
   };
+}
+
+// Deterministic, offline fallback for turning shorthand bullet notes into a
+// readable paragraph — used whenever the AI collation path is unavailable.
+function formatBulletsToParagraph(bulletText) {
+  const points = String(bulletText || '')
+    .split('\n')
+    .map((line) => line.replace(/^[\s*\-•]+/, '').trim())
+    .filter(Boolean);
+  if (!points.length) return '';
+  return points
+    .map((point) => {
+      const capitalized = point.charAt(0).toUpperCase() + point.slice(1);
+      return /[.!?]$/.test(capitalized) ? capitalized : `${capitalized}.`;
+    })
+    .join(' ');
+}
+
+// Calls the Claude API directly from the browser (bring-your-own API key,
+// stored only in this browser's localStorage) to turn interviewer bullet
+// notes into a coherent overall-assessment paragraph. Callers must catch and
+// fall back to formatBulletsToParagraph() — this throws on any failure
+// (no key, offline, rate limit, network error, etc.) by design, since the
+// feature must never block completing an interview.
+//
+// Uses a plain fetch() call rather than @anthropic-ai/sdk: the SDK's
+// credential-resolution code does a dynamic `import('node:fs')`, which
+// Create React App's stock Webpack 5 config can't bundle without ejecting or
+// adding extra build tooling — not worth it for one optional convenience
+// feature. anthropic-dangerous-direct-browser-access is the documented
+// opt-in header for calling the Messages API directly from a browser.
+async function collateFeedbackWithAI(bulletText, apiKey) {
+  if (!apiKey) throw new Error('No Anthropic API key configured.');
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+    throw new Error('Offline.');
+  }
+
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01',
+      'anthropic-dangerous-direct-browser-access': 'true',
+    },
+    body: JSON.stringify({
+      model: CLAUDE_MODEL_ID,
+      max_tokens: 600,
+      output_config: { effort: 'low' },
+      system:
+        "You write a candidate interview assessment paragraph from an interviewer's shorthand bullet notes. " +
+        'Use only the information in the notes — do not invent facts, scores, or details not present. ' +
+        'Write 3-6 sentences of plain prose, professional and specific, with no headings, bullets, or markdown.',
+      messages: [{ role: 'user', content: String(bulletText || '').trim() }],
+    }),
+  });
+
+  if (!res.ok) {
+    const errorBody = await res.json().catch(() => null);
+    throw new Error(errorBody?.error?.message || `Claude API request failed (${res.status}).`);
+  }
+
+  const data = await res.json();
+  if (data.stop_reason === 'refusal') {
+    throw new Error('The request was declined.');
+  }
+  const textBlock = (data.content || []).find((block) => block.type === 'text');
+  const text = textBlock?.text?.trim();
+  if (!text) throw new Error('Empty response from the API.');
+  return text;
 }
 
 function buildTxtReport(interview) {
@@ -237,6 +644,7 @@ function buildTxtReport(interview) {
   lines.push(divider, 'INTERVIEW ASSESSMENT REPORT', divider, '');
   lines.push(`Candidate:    ${interview.candidateName}`);
   lines.push(`Domain:       ${interview.domainName}`);
+  lines.push(`Level:        ${interview.levelLabel || interview.level || '—'}`);
   lines.push(`Interviewer:  ${interview.interviewer || '—'}`);
   lines.push(`Date:         ${formatDate(interview.date)}`);
   lines.push(`Status:       ${STATUS_LABELS[interview.status] || interview.status}`);
@@ -244,8 +652,11 @@ function buildTxtReport(interview) {
 
   interview.responses.forEach((r, idx) => {
     lines.push('', `${idx + 1}. ${r.questionText}`);
-    lines.push(`   Response: ${r.response ? r.response : '(no response recorded)'}`);
-    lines.push(`   Rating:   ${r.rating ? `${r.rating}/10` : 'Not rated'}`);
+    lines.push(`   Response:          ${r.response ? r.response : '(no response recorded)'}`);
+    lines.push(`   Rating:            ${r.rating ? `${r.rating}/10` : 'Not rated'}`);
+    if (r.referenceAnswer) {
+      lines.push(`   Reference Answer:  ${r.referenceAnswer}`);
+    }
   });
 
   lines.push('', sub, 'SCORES', sub);
@@ -269,6 +680,7 @@ function buildCsvReport(interview) {
   rows.push(['Field', 'Value']);
   rows.push(['Candidate', interview.candidateName]);
   rows.push(['Domain', interview.domainName]);
+  rows.push(['Level', interview.levelLabel || interview.level || '']);
   rows.push(['Interviewer', interview.interviewer || '']);
   rows.push(['Date', interview.date || '']);
   rows.push(['Status', STATUS_LABELS[interview.status] || interview.status]);
@@ -278,9 +690,9 @@ function buildCsvReport(interview) {
   rows.push(['Overall Assessment', interview.overallAssessment || '']);
   rows.push(['Recommendation', interview.recommendation || '']);
   rows.push([]);
-  rows.push(['#', 'Question', 'Response', 'Rating (1-10)']);
+  rows.push(['#', 'Question', 'Response', 'Rating (1-10)', 'Reference Answer']);
   interview.responses.forEach((r, idx) => {
-    rows.push([idx + 1, r.questionText, r.response || '', r.rating ?? '']);
+    rows.push([idx + 1, r.questionText, r.response || '', r.rating ?? '', r.referenceAnswer || '']);
   });
   return rows.map((row) => row.map(csvEscape).join(',')).join('\r\n');
 }
@@ -629,12 +1041,21 @@ function DashboardView({ session, domains, interviews, onNavigate, onResume, onV
    ========================================================================== */
 
 function NewInterviewView({ domains, defaultInterviewer, onCreate, onCancel }) {
+  const technicalDomains = useMemo(() => domains.filter((d) => d.id !== BEHAVIORAL_DOMAIN_ID), [domains]);
+  const behavioralDomain = useMemo(() => domains.find((d) => d.id === BEHAVIORAL_DOMAIN_ID), [domains]);
+
   const [candidateName, setCandidateName] = useState('');
-  const [domainId, setDomainId] = useState(domains[0]?.id || '');
+  const [domainId, setDomainId] = useState(technicalDomains[0]?.id || '');
+  const [level, setLevel] = useState(LEVELS[1]?.id || LEVELS[0]?.id || '');
   const [interviewer, setInterviewer] = useState(defaultInterviewer || '');
   const [date, setDate] = useState(todayInputDate());
   const [notes, setNotes] = useState('');
   const [error, setError] = useState('');
+
+  const domain = technicalDomains.find((d) => d.id === domainId);
+  const questionCount =
+    (domain?.questions.filter((q) => q.level === level).length || 0) +
+    (behavioralDomain?.questions.filter((q) => q.level === level).length || 0);
 
   function handleSubmit(event) {
     event.preventDefault();
@@ -642,15 +1063,22 @@ function NewInterviewView({ domains, defaultInterviewer, onCreate, onCancel }) {
       setError('Candidate name is required.');
       return;
     }
-    const domain = domains.find((d) => d.id === domainId);
     if (!domain) {
       setError('Please select a domain.');
+      return;
+    }
+    if (questionCount === 0) {
+      setError(
+        `No questions found for ${domain.name} at the ${LEVEL_LABELS[level]} level. Add some in the Question Bank first.`
+      );
       return;
     }
     setError('');
     onCreate({
       candidateName: candidateName.trim(),
       domain,
+      level,
+      behavioralDomain,
       interviewer: interviewer.trim(),
       date,
       notes: notes.trim(),
@@ -680,12 +1108,26 @@ function NewInterviewView({ domains, defaultInterviewer, onCreate, onCancel }) {
           <div className="ip-field">
             <label htmlFor="ni-domain">Domain *</label>
             <select id="ni-domain" value={domainId} onChange={(e) => setDomainId(e.target.value)}>
-              {domains.map((d) => (
+              {technicalDomains.map((d) => (
                 <option key={d.id} value={d.id}>
-                  {d.name} ({d.questions.length} questions)
+                  {d.name}
                 </option>
               ))}
             </select>
+          </div>
+          <div className="ip-field">
+            <label htmlFor="ni-level">Candidate Level *</label>
+            <select id="ni-level" value={level} onChange={(e) => setLevel(e.target.value)}>
+              {LEVELS.map((l) => (
+                <option key={l.id} value={l.id}>
+                  {l.label}
+                </option>
+              ))}
+            </select>
+            <p className="ip-small ip-text-muted">
+              {questionCount} question{questionCount === 1 ? '' : 's'} will be used ({domain?.name || 'domain'} +
+              Behavioral &amp; SDLC, both at this level).
+            </p>
           </div>
           <div className="ip-field">
             <label htmlFor="ni-interviewer">Interviewer</label>
@@ -729,8 +1171,10 @@ function NewInterviewView({ domains, defaultInterviewer, onCreate, onCancel }) {
    Interview Session
    ========================================================================== */
 
-function SessionView({ interview, onUpdateResponse, onUpdateInterview, onComplete, onBack }) {
+function SessionView({ interview, onUpdateResponse, onUpdateInterview, onComplete, onGenerateAssessment, onBack }) {
   const [tab, setTab] = useState('questions');
+  const [expandedRefs, setExpandedRefs] = useState(() => new Set());
+  const [isCollating, setIsCollating] = useState(false);
 
   if (!interview) {
     return (
@@ -740,13 +1184,35 @@ function SessionView({ interview, onUpdateResponse, onUpdateInterview, onComplet
 
   const answeredCount = interview.responses.filter((r) => r.rating !== null).length;
 
+  function toggleReferenceAnswer(questionId) {
+    setExpandedRefs((prev) => {
+      const next = new Set(prev);
+      if (next.has(questionId)) next.delete(questionId);
+      else next.add(questionId);
+      return next;
+    });
+  }
+
+  async function handleGenerateClick() {
+    setIsCollating(true);
+    try {
+      const text = await onGenerateAssessment(interview.feedbackBullets);
+      if (text !== null) {
+        onUpdateInterview(interview.id, { overallAssessment: text });
+      }
+    } finally {
+      setIsCollating(false);
+    }
+  }
+
   return (
     <div>
       <div className="ip-page-header">
         <div>
           <h1>{interview.candidateName}</h1>
           <p className="ip-text-muted">
-            {interview.domainName} &middot; Interviewer: {interview.interviewer} &middot; {formatDate(interview.date)}
+            {interview.domainName} &middot; {interview.levelLabel} &middot; Interviewer: {interview.interviewer}{' '}
+            &middot; {formatDate(interview.date)}
           </p>
         </div>
         <Badge tone={STATUS_TONES[interview.status]}>{STATUS_LABELS[interview.status]}</Badge>
@@ -807,6 +1273,20 @@ function SessionView({ interview, onUpdateResponse, onUpdateInterview, onComplet
                   ))}
                 </select>
               </div>
+              {r.referenceAnswer && (
+                <>
+                  <button
+                    type="button"
+                    className="ip-btn ip-btn-sm ip-btn-ghost"
+                    onClick={() => toggleReferenceAnswer(r.questionId)}
+                  >
+                    {expandedRefs.has(r.questionId) ? 'Hide Reference Answer' : 'Show Reference Answer'}
+                  </button>
+                  {expandedRefs.has(r.questionId) && (
+                    <p className="ip-reference-answer">{r.referenceAnswer}</p>
+                  )}
+                </>
+              )}
             </div>
           ))}
           <div className="ip-form-actions">
@@ -878,13 +1358,35 @@ function SessionView({ interview, onUpdateResponse, onUpdateInterview, onComplet
             </select>
           </div>
           <div className="ip-field">
+            <label htmlFor="feedback-bullets">Feedback Notes (one point per line)</label>
+            <textarea
+              id="feedback-bullets"
+              rows={4}
+              value={interview.feedbackBullets}
+              onChange={(e) => onUpdateInterview(interview.id, { feedbackBullets: e.target.value })}
+              placeholder={'Jot down quick points as you go, e.g.\nstrong on system design tradeoffs\nstruggled to explain time complexity\ngood communication, asked clarifying questions'}
+            />
+            <button
+              type="button"
+              className="ip-btn ip-btn-secondary ip-btn-sm"
+              onClick={handleGenerateClick}
+              disabled={isCollating || !interview.feedbackBullets.trim()}
+            >
+              {isCollating ? 'Generating...' : 'Generate Assessment from Notes'}
+            </button>
+            <p className="ip-small ip-text-muted">
+              Uses Claude when an API key is set in Settings and you're online; otherwise falls back to plain
+              formatting automatically.
+            </p>
+          </div>
+          <div className="ip-field">
             <label htmlFor="overall-assessment">Overall Assessment</label>
             <textarea
               id="overall-assessment"
               rows={4}
               value={interview.overallAssessment}
               onChange={(e) => onUpdateInterview(interview.id, { overallAssessment: e.target.value })}
-              placeholder="Summarize strengths, gaps, and concerns..."
+              placeholder="Summarize strengths, gaps, and concerns... (or generate from notes above)"
             />
           </div>
           <div className="ip-field">
@@ -923,14 +1425,25 @@ function SessionView({ interview, onUpdateResponse, onUpdateInterview, onComplet
 function QuestionBankView({ domains, onAddQuestion, onDeleteQuestion }) {
   const [selectedDomainId, setSelectedDomainId] = useState(domains[0]?.id || '');
   const [newQuestion, setNewQuestion] = useState('');
+  const [newLevel, setNewLevel] = useState(LEVELS[1]?.id || LEVELS[0]?.id || '');
+  const [newReferenceAnswer, setNewReferenceAnswer] = useState('');
+  const [levelFilter, setLevelFilter] = useState('all');
 
   const selectedDomain = domains.find((d) => d.id === selectedDomainId) || domains[0];
+  const visibleQuestions = selectedDomain
+    ? selectedDomain.questions.filter((q) => levelFilter === 'all' || q.level === levelFilter)
+    : [];
 
   function handleAdd(event) {
     event.preventDefault();
     if (!newQuestion.trim() || !selectedDomain) return;
-    onAddQuestion(selectedDomain.id, newQuestion.trim());
+    onAddQuestion(selectedDomain.id, {
+      text: newQuestion.trim(),
+      level: newLevel,
+      referenceAnswer: newReferenceAnswer.trim(),
+    });
     setNewQuestion('');
+    setNewReferenceAnswer('');
   }
 
   function handleDelete(questionId) {
@@ -948,7 +1461,7 @@ function QuestionBankView({ domains, onAddQuestion, onDeleteQuestion }) {
       <div className="ip-page-header">
         <div>
           <h1>Question Bank</h1>
-          <p className="ip-text-muted">Manage interview questions for each domain.</p>
+          <p className="ip-text-muted">Manage interview questions for each domain and level.</p>
         </div>
       </div>
 
@@ -967,32 +1480,74 @@ function QuestionBankView({ domains, onAddQuestion, onDeleteQuestion }) {
 
       <div className="ip-card">
         <h3>Add a Question</h3>
-        <form onSubmit={handleAdd} className="ip-form-inline">
-          <textarea
-            rows={2}
-            value={newQuestion}
-            onChange={(e) => setNewQuestion(e.target.value)}
-            placeholder={`New question for ${selectedDomain.name}...`}
-          />
-          <button type="submit" className="ip-btn ip-btn-primary">
-            Add Question
-          </button>
+        <form onSubmit={handleAdd}>
+          <div className="ip-field">
+            <label htmlFor="qb-text">Question</label>
+            <textarea
+              id="qb-text"
+              rows={2}
+              value={newQuestion}
+              onChange={(e) => setNewQuestion(e.target.value)}
+              placeholder={`New question for ${selectedDomain.name}...`}
+            />
+          </div>
+          <div className="ip-field ip-field-inline">
+            <label htmlFor="qb-level">Level</label>
+            <select id="qb-level" value={newLevel} onChange={(e) => setNewLevel(e.target.value)}>
+              {LEVELS.map((l) => (
+                <option key={l.id} value={l.id}>
+                  {l.label}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="ip-field">
+            <label htmlFor="qb-reference">Reference Answer (optional, but helps non-expert interviewers)</label>
+            <textarea
+              id="qb-reference"
+              rows={2}
+              value={newReferenceAnswer}
+              onChange={(e) => setNewReferenceAnswer(e.target.value)}
+              placeholder="What should a strong answer cover?"
+            />
+          </div>
+          <div className="ip-form-actions ip-form-actions-start">
+            <button type="submit" className="ip-btn ip-btn-primary">
+              Add Question
+            </button>
+          </div>
         </form>
       </div>
 
       <div className="ip-card">
-        <h3>{selectedDomain.name} Questions</h3>
-        {selectedDomain.questions.length === 0 ? (
+        <div className="ip-page-header">
+          <h3>{selectedDomain.name} Questions</h3>
+          <select value={levelFilter} onChange={(e) => setLevelFilter(e.target.value)} className="ip-level-filter">
+            <option value="all">All levels</option>
+            {LEVELS.map((l) => (
+              <option key={l.id} value={l.id}>
+                {l.label}
+              </option>
+            ))}
+          </select>
+        </div>
+        {visibleQuestions.length === 0 ? (
           <EmptyState title="No questions yet" body="Add your first question above." />
         ) : (
-          selectedDomain.questions.map((q, idx) => (
-            <div className="ip-question-card ip-question-card-compact" key={q.id}>
-              <p>
-                {idx + 1}. {q.text}
-              </p>
-              <button type="button" className="ip-btn ip-btn-sm ip-btn-danger" onClick={() => handleDelete(q.id)}>
-                Delete
-              </button>
+          visibleQuestions.map((q, idx) => (
+            <div className="ip-question-card" key={q.id}>
+              <div className="ip-question-card-compact">
+                <p className="ip-question-text">
+                  {idx + 1}. {q.text}
+                </p>
+                <div className="ip-table-actions">
+                  <Badge tone="info">{LEVEL_LABELS[q.level] || q.level}</Badge>
+                  <button type="button" className="ip-btn ip-btn-sm ip-btn-danger" onClick={() => handleDelete(q.id)}>
+                    Delete
+                  </button>
+                </div>
+              </div>
+              {q.referenceAnswer && <p className="ip-reference-answer">{q.referenceAnswer}</p>}
             </div>
           ))
         )}
@@ -1109,6 +1664,7 @@ function DataView({ domains, interviews, onDeleteInterview, onViewReport, onResu
                 <tr>
                   <th>Candidate</th>
                   <th>Domain</th>
+                  <th>Level</th>
                   <th>Date</th>
                   <th>Status</th>
                   <th>Recommendation</th>
@@ -1123,6 +1679,7 @@ function DataView({ domains, interviews, onDeleteInterview, onViewReport, onResu
                     <tr key={iv.id}>
                       <td>{iv.candidateName}</td>
                       <td>{iv.domainName}</td>
+                      <td>{iv.levelLabel || iv.level || '—'}</td>
                       <td>{formatDate(iv.date)}</td>
                       <td>
                         <Badge tone={STATUS_TONES[iv.status]}>{STATUS_LABELS[iv.status]}</Badge>
@@ -1185,7 +1742,8 @@ function ReportView({ interview, onDownloadTxt, onDownloadJson, onDownloadCsv, o
         <div>
           <h1>{interview.candidateName}</h1>
           <p className="ip-text-muted">
-            {interview.domainName} &middot; Interviewer: {interview.interviewer} &middot; {formatDate(interview.date)}
+            {interview.domainName} &middot; {interview.levelLabel} &middot; Interviewer: {interview.interviewer}{' '}
+            &middot; {formatDate(interview.date)}
           </p>
         </div>
         <Badge tone={STATUS_TONES[interview.status]}>{STATUS_LABELS[interview.status]}</Badge>
@@ -1247,6 +1805,7 @@ function ReportView({ interview, onDownloadTxt, onDownloadJson, onDownloadCsv, o
             </p>
             <p>{r.response || <span className="ip-text-muted">No response recorded.</span>}</p>
             <Badge tone="neutral">{r.rating ? `${r.rating}/10` : 'Not rated'}</Badge>
+            {r.referenceAnswer && <p className="ip-reference-answer">Reference: {r.referenceAnswer}</p>}
           </div>
         ))}
       </div>
@@ -1272,6 +1831,78 @@ function ReportView({ interview, onDownloadTxt, onDownloadJson, onDownloadCsv, o
 }
 
 /* ==========================================================================
+   Settings
+   ========================================================================== */
+
+function SettingsView({ apiKey, onSaveApiKey, onClearApiKey }) {
+  const [keyInput, setKeyInput] = useState(apiKey || '');
+
+  function handleSave(event) {
+    event.preventDefault();
+    onSaveApiKey(keyInput.trim());
+  }
+
+  function handleClear() {
+    setKeyInput('');
+    onClearApiKey();
+  }
+
+  return (
+    <div>
+      <div className="ip-page-header">
+        <div>
+          <h1>Settings</h1>
+          <p className="ip-text-muted">Optional AI assistance for collating interviewer feedback.</p>
+        </div>
+      </div>
+
+      <div className="ip-card ip-card-narrow">
+        <h3>Claude API Key</h3>
+        <p className="ip-text-muted">
+          When set, the "Generate Assessment from Notes" button in an interview session uses Claude to turn your
+          bullet-point feedback into a polished paragraph. Without a key — or without an internet connection — it
+          automatically falls back to simple offline formatting, so interviews are never blocked.
+        </p>
+        <form onSubmit={handleSave}>
+          <div className="ip-field">
+            <label htmlFor="settings-api-key">Anthropic API Key</label>
+            <input
+              id="settings-api-key"
+              type="password"
+              value={keyInput}
+              onChange={(e) => setKeyInput(e.target.value)}
+              placeholder="sk-ant-..."
+              autoComplete="off"
+            />
+          </div>
+          <div className="ip-form-actions ip-form-actions-start">
+            <button type="submit" className="ip-btn ip-btn-primary">
+              Save Key
+            </button>
+            <button type="button" className="ip-btn ip-btn-ghost" onClick={handleClear}>
+              Clear Key
+            </button>
+          </div>
+        </form>
+        <p className="ip-small ip-text-muted">
+          {apiKey ? (
+            <>
+              <Badge tone="success">AI collation enabled</Badge> &mdash; this key is stored only in this browser's
+              localStorage and is sent directly to Anthropic's API, never anywhere else.
+            </>
+          ) : (
+            <>
+              <Badge tone="neutral">AI collation disabled</Badge> &mdash; add a key above to enable it, or keep
+              using the offline formatter.
+            </>
+          )}
+        </p>
+      </div>
+    </div>
+  );
+}
+
+/* ==========================================================================
    Main application component
    ========================================================================== */
 
@@ -1282,6 +1913,7 @@ function InterviewPlatform() {
     return loaded && Array.isArray(loaded) && loaded.length > 0 ? loaded : DEFAULT_DOMAINS;
   });
   const [interviews, setInterviews] = useState(() => safeLoad(STORAGE_KEYS.interviews, []));
+  const [settings, setSettings] = useState(() => safeLoad(STORAGE_KEYS.settings, { anthropicApiKey: '' }));
   const [view, setView] = useState('dashboard');
   const [activeInterviewId, setActiveInterviewId] = useState(null);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
@@ -1294,6 +1926,10 @@ function InterviewPlatform() {
   useEffect(() => {
     safeSave(STORAGE_KEYS.interviews, interviews);
   }, [interviews]);
+
+  useEffect(() => {
+    safeSave(STORAGE_KEYS.settings, settings);
+  }, [settings]);
 
   useEffect(() => {
     if (session) {
@@ -1414,9 +2050,13 @@ function InterviewPlatform() {
   }, []);
 
   const handleAddQuestion = useCallback(
-    (domainId, text) => {
+    (domainId, { text, level, referenceAnswer }) => {
       setDomains((prev) =>
-        prev.map((d) => (d.id !== domainId ? d : { ...d, questions: [...d.questions, { id: generateId(), text }] }))
+        prev.map((d) =>
+          d.id !== domainId
+            ? d
+            : { ...d, questions: [...d.questions, { id: generateId(), text, level, referenceAnswer }] }
+        )
       );
       showToast('Question added.', 'success');
     },
@@ -1431,6 +2071,41 @@ function InterviewPlatform() {
       showToast('Question removed.', 'info');
     },
     [showToast]
+  );
+
+  const handleSaveApiKey = useCallback(
+    (apiKey) => {
+      setSettings((prev) => ({ ...prev, anthropicApiKey: apiKey }));
+      showToast(apiKey ? 'API key saved. AI collation is now enabled.' : 'API key cleared.', 'success');
+    },
+    [showToast]
+  );
+
+  const handleClearApiKey = useCallback(() => {
+    setSettings((prev) => ({ ...prev, anthropicApiKey: '' }));
+    showToast('API key cleared. AI collation is disabled.', 'info');
+  }, [showToast]);
+
+  // Tries Claude first; on ANY failure (no key, offline, rate limit, server
+  // error, etc.) falls back to the deterministic offline formatter so an
+  // interview can always be completed. Returns null only when there were no
+  // bullet notes to work with.
+  const handleGenerateAssessment = useCallback(
+    async (bulletText) => {
+      if (!bulletText || !bulletText.trim()) {
+        showToast('Add some feedback notes first.', 'danger');
+        return null;
+      }
+      try {
+        const text = await collateFeedbackWithAI(bulletText, settings.anthropicApiKey);
+        showToast('Assessment drafted with Claude.', 'success');
+        return text;
+      } catch {
+        showToast('AI unavailable right now — used offline formatting instead.', 'info');
+        return formatBulletsToParagraph(bulletText);
+      }
+    },
+    [settings.anthropicApiKey, showToast]
   );
 
   const handleExportAll = useCallback(() => {
@@ -1510,6 +2185,7 @@ function InterviewPlatform() {
           onUpdateResponse={handleUpdateResponse}
           onUpdateInterview={handleUpdateInterview}
           onComplete={handleCompleteInterview}
+          onGenerateAssessment={handleGenerateAssessment}
           onBack={() => setView('dashboard')}
         />
       );
@@ -1517,6 +2193,15 @@ function InterviewPlatform() {
     case 'questions':
       pageContent = (
         <QuestionBankView domains={domains} onAddQuestion={handleAddQuestion} onDeleteQuestion={handleDeleteQuestion} />
+      );
+      break;
+    case 'settings':
+      pageContent = (
+        <SettingsView
+          apiKey={settings.anthropicApiKey}
+          onSaveApiKey={handleSaveApiKey}
+          onClearApiKey={handleClearApiKey}
+        />
       );
       break;
     case 'data':
@@ -1811,6 +2496,23 @@ const APP_STYLES = `
 }
 .ip-question-card-compact { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; flex-wrap: wrap; }
 .ip-question-text { font-weight: 600; margin-bottom: 10px; }
+.ip-reference-answer {
+  margin-top: 10px;
+  padding: 10px 12px;
+  background: #f8fafc;
+  border-left: 3px solid var(--color-primary-light);
+  border-radius: var(--radius-sm);
+  font-size: 0.88rem;
+  color: var(--color-text-muted);
+}
+.ip-level-filter {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  padding: 6px 10px;
+  background: #fff;
+  color: var(--color-text);
+  height: fit-content;
+}
 
 .ip-empty-state { text-align: center; padding: 32px 16px; }
 .ip-empty-state h3 { margin-bottom: 6px; }
