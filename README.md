@@ -37,18 +37,19 @@ Interview Platform is a static React app. Everything — domains, questions, int
 
 | Option | Cost | Command |
 | --- | --- | --- |
-| GitHub Pages | $0 | `npm run deploy` |
+| GitHub Pages (auto) | $0 | Just `git push` to `main` — a GitHub Action builds and deploys for you |
+| GitHub Pages (manual) | $0 | `npm run deploy` |
 | Vercel / Netlify | $0 (free tier) | Connect the repo, build command `npm run build`, output dir `build` |
 | Local only | $0 | `npm start` (dev) or serve the `build/` folder with any static file server |
 
-To deploy to GitHub Pages:
+Every push to `main` (other than docs-only changes) triggers `.github/workflows/deploy.yml`, which builds the app and publishes `build/` to the `gh-pages` branch — no manual step needed. To deploy by hand instead:
 
 ```bash
 npm run build
 npm run deploy
 ```
 
-Your app will be live at `https://cloudcompilerr.github.io/interview-platform/`.
+Your app is live at `https://cloudcompilerr.github.io/interview-platform/`.
 
 ## Cost
 
